@@ -10,7 +10,8 @@ from database.models import User, Event, EventRegistration
 from keyboards.keyboards import (
     get_main_menu, get_cities_keyboard, get_events_keyboard,
     get_event_actions_keyboard, build_events_list_keyboard,
-    get_back_keyboard
+    get_back_keyboard, get_next_event_keyboard,
+    get_no_events_keyboard
 )
 from datetime import datetime
 import os
@@ -72,10 +73,142 @@ async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup=Non
             reply_markup=reply_markup
         )
 
+async def get_next_event_for_user(user_id: int, city: str = None):
+    """Получить ближайшее мероприятие для пользователя"""
+    async with async_session() as session:
+        query = select(Event).where(
+            Event.is_visible == True,
+            Event.date_time > datetime.now()
+        )
+        
+        # Если у пользователя указан город, сначала ищем в его городе
+        if city:
+            city_query = query.where(Event.city == city).order_by(Event.date_time).limit(1)
+            result = await session.execute(city_query)
+            event = result.scalar_one_or_none()
+            
+            if event:
+                return event
+        
+        # Если в городе нет мероприятий или город не указан, берем любое ближайшее
+        all_query = query.order_by(Event.date_time).limit(1)
+        result = await session.execute(all_query)
+        return result.scalar_one_or_none()
+
+async def format_next_event_message(event, user_city: str = None, participants_count: int = 0):
+    """Форматирование сообщения с ближайшим мероприятием"""
+    if not event:
+        return (
+            "🎉 <b>Добро пожаловать!</b>\n\n"
+            "😔 Пока нет запланированных мероприятий, но они скоро появятся!\n\n"
+            "Выберите город, чтобы получать уведомления о новых мероприятиях:"
+        )
+    
+    # Определяем, в городе пользователя это мероприятие или нет
+    city_indicator = ""
+    if user_city and event.city != user_city:
+        city_indicator = f" (в другом городе)"
+    elif user_city and event.city == user_city:
+        city_indicator = f" 🎯"
+    
+    # Считаем время до мероприятия
+    time_until = event.date_time - datetime.now()
+    
+    if time_until.days > 0:
+        time_text = f"через {time_until.days} дн."
+    elif time_until.seconds > 3600:
+        hours = time_until.seconds // 3600
+        time_text = f"через {hours} ч."
+    else:
+        minutes = time_until.seconds // 60
+        time_text = f"через {minutes} мин."
+    
+    message = f"🎉 <b>Ближайшее мероприятие{city_indicator}</b>\n\n"
+    message += f"📅 <b>{event.title}</b>\n"
+    message += f"🏙️ <b>Город:</b> {event.city}\n"
+    message += f"🕐 <b>Дата:</b> {event.date_time.strftime('%d.%m.%Y в %H:%M')} ({time_text})\n"
+    
+    if event.location:
+        message += f"📍 <b>Место:</b> {event.location}\n"
+    
+    if event.max_participants:
+        percentage = (participants_count / event.max_participants) * 100
+        message += f"👥 <b>Участники:</b> {participants_count}/{event.max_participants} ({percentage:.0f}%)\n"
+    else:
+        message += f"👥 <b>Участники:</b> {participants_count}\n"
+    
+    if event.description and len(event.description) <= 100:
+        message += f"\n📝 {event.description}\n"
+    elif event.description:
+        message += f"\n📝 {event.description[:97]}...\n"
+    
+    return message
+
+async def show_next_event_welcome(message_or_callback, user, is_callback=False):
+    """Показать приветствие с ближайшим мероприятием"""
+    # Получаем ближайшее мероприятие
+    next_event = await get_next_event_for_user(user.telegram_id, user.city)
+    
+    # Считаем участников если мероприятие есть
+    participants_count = 0
+    if next_event:
+        async with async_session() as session:
+            participants_result = await session.execute(
+                select(EventRegistration).where(EventRegistration.event_id == next_event.id)
+            )
+            participants_count = len(participants_result.scalars().all())
+    
+    # Формируем сообщение
+    welcome_text = f"Добро пожаловать, {user.first_name}! 👋\n\n"
+    
+    if user.role == 'admin':
+        welcome_text += "🔱 Вы администратор бота\n\n"
+    elif user.role == 'moderator':
+        welcome_text += "🛡 Вы модератор бота\n\n"
+    
+    event_message = await format_next_event_message(next_event, user.city, participants_count)
+    full_message = welcome_text + event_message
+    
+    # Клавиатура
+    if next_event:
+        keyboard = get_next_event_keyboard(next_event.id, True)
+    else:
+        keyboard = get_no_events_keyboard()
+    
+    # Отправляем сообщение
+    if is_callback:
+        await safe_edit_message(
+            message_or_callback,
+            full_message,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    else:
+        # Если есть фото/видео у мероприятия, отправляем с медиа
+        if next_event and next_event.photo_file_id:
+            await message_or_callback.answer_photo(
+                photo=next_event.photo_file_id,
+                caption=full_message,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        elif next_event and next_event.video_file_id:
+            await message_or_callback.answer_video(
+                video=next_event.video_file_id,
+                caption=full_message,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        else:
+            await message_or_callback.answer(
+                full_message,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
 
 @router.message(Command("start"))
 async def start_command(message: Message):
-    """Команда /start"""
+    """Команда /start - показ ближайшего мероприятия"""
     user = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
@@ -83,19 +216,7 @@ async def start_command(message: Message):
         last_name=message.from_user.last_name
     )
     
-    welcome_text = f"Добро пожаловать, {user.first_name}! 🎉\n\n"
-    
-    if user.role == 'admin':
-        welcome_text += "Вы являетесь администратором бота.\n"
-    elif user.role == 'moderator':
-        welcome_text += "Вы являетесь модератором бота.\n"
-    
-    welcome_text += "Выберите действие из меню ниже:"
-    
-    await message.answer(
-        welcome_text,
-        reply_markup=get_main_menu(user.role)
-    )
+    await show_next_event_welcome(message, user, is_callback=False)
 
 @router.message(F.text == "🏙️ Выбрать город")
 async def select_city(message: Message):
@@ -120,12 +241,9 @@ async def handle_city_selection(callback: CallbackQuery):
             user.city = city_name
             await session.commit()
     
-    await safe_edit_message(
-        callback,
-        f"Ваш город: {city_name} ✅\n\nТеперь вы будете видеть мероприятия в вашем городе.",
-        reply_markup=get_cities_keyboard()
-    )
-    await callback.answer()
+    # Возвращаемся к приветствию с обновленным городом
+    await show_next_event_welcome(callback, user, is_callback=True)
+    await callback.answer(f"Ваш город: {city_name} ✅")
 
 @router.message(F.text == "📅 Мероприятия")
 async def show_events_menu(message: Message):
@@ -658,6 +776,126 @@ async def show_event_participants(callback: CallbackQuery):
         parse_mode="HTML",
         reply_markup=keyboard
     )
+    await callback.answer()
+
+@router.callback_query(F.data == "show_main_menu")
+async def show_main_menu_callback(callback: CallbackQuery):
+    """Показать главное меню через callback"""
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        role = user.role if user else 'user'
+    
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    await callback.message.answer(
+        "📋 <b>Главное меню:</b>",
+        parse_mode="HTML",
+        reply_markup=get_main_menu(role)
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "select_city_inline")
+async def select_city_inline(callback: CallbackQuery):
+    """Выбор города через inline кнопку"""
+    await safe_edit_message(
+        callback,
+        "🏙️ <b>Выберите ваш город:</b>",
+        parse_mode="HTML",
+        reply_markup=get_cities_keyboard()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "show_profile")
+async def show_profile_callback(callback: CallbackQuery):
+    """Показать профиль через callback"""
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        # Считаем статистику
+        events_created_result = await session.execute(
+            select(Event).where(Event.creator_id == user.id)
+        )
+        events_created = len(events_created_result.scalars().all())
+        
+        events_registered_result = await session.execute(
+            select(EventRegistration)
+            .join(User)
+            .where(User.telegram_id == callback.from_user.id)
+        )
+        events_registered = len(events_registered_result.scalars().all())
+        
+        # Предстоящие мероприятия
+        upcoming_events_result = await session.execute(
+            select(Event)
+            .join(EventRegistration)
+            .join(User)
+            .where(
+                User.telegram_id == callback.from_user.id,
+                Event.date_time > datetime.now()
+            )
+        )
+        upcoming_events = len(upcoming_events_result.scalars().all())
+    
+    role_names = {
+        'user': 'Пользователь',
+        'moderator': 'Модератор', 
+        'admin': 'Администратор'
+    }
+    
+    profile_text = f"👤 <b>Ваш профиль</b>\n\n"
+    profile_text += f"🔹 <b>Имя:</b> {user.first_name or 'Не указано'}"
+    if user.last_name:
+        profile_text += f" {user.last_name}"
+    profile_text += "\n"
+    
+    if user.username:
+        profile_text += f"🔹 <b>Username:</b> @{user.username}\n"
+    
+    profile_text += f"🔹 <b>Роль:</b> {role_names.get(user.role, 'Неизвестно')}\n"
+    profile_text += f"🔹 <b>Город:</b> {user.city or 'Не выбран'}\n"
+    profile_text += f"🔹 <b>Дата регистрации:</b> {user.created_at.strftime('%d.%m.%Y')}\n\n"
+    
+    profile_text += f"📊 <b>Статистика:</b>\n"
+    if user.role in ['moderator', 'admin']:
+        profile_text += f"• Создано мероприятий: {events_created}\n"
+    profile_text += f"• Записей на мероприятия: {events_registered}\n"
+    profile_text += f"• Предстоящих мероприятий: {upcoming_events}\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить имя", callback_data="edit_profile_name")],
+        [InlineKeyboardButton(text="🏙️ Изменить город", callback_data="edit_profile_city")],
+        [InlineKeyboardButton(text="🏠 На главную", callback_data="back_to_welcome")]
+    ])
+    
+    await safe_edit_message(
+        callback,
+        profile_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_welcome")
+async def back_to_welcome(callback: CallbackQuery):
+    """Возврат к приветствию с ближайшим мероприятием"""
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+    
+    await show_next_event_welcome(callback, user, is_callback=True)
     await callback.answer()
 
 @router.message()

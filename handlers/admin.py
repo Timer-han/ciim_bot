@@ -8,8 +8,8 @@ from database.database import async_session
 from database.models import User, Event, EventRegistration
 from keyboards.keyboards import (
     get_admin_panel_keyboard, get_event_management_keyboard,
-    get_broadcast_keyboard, get_confirmation_keyboard,
-    build_events_list_keyboard, get_back_keyboard, get_cancel_keyboard
+    get_broadcast_keyboard, get_confirmation_keyboard, get_schedule_keyboard,
+    build_events_list_keyboard, get_back_keyboard, get_cancel_keyboard,
 )
 from datetime import datetime, timedelta
 import re
@@ -41,6 +41,9 @@ class ManageAdminStates(StatesGroup):
 class BroadcastStates(StatesGroup):
     target = State()
     message_text = State()
+    media = State()
+    schedule_choice = State()
+    schedule_time = State()
     confirm = State()
 
 async def check_admin_or_moderator(telegram_id: int) -> tuple[bool, str]:
@@ -941,9 +944,140 @@ async def delete_event_confirmed(callback: CallbackQuery):
 async def cancel_delete_event(callback: CallbackQuery):
     """Отмена удаления мероприятия"""
     event_id = int(callback.data.split("_")[3])
-    # Создаем новый callback для возврата к мероприятию
-    callback.data = f"manage_event_{event_id}"
-    await show_event_management_details(callback)
+    
+    # Вместо изменения callback.data создаем новый callback с нужными данными
+    try:
+        async with async_session() as session:
+            result = await session.execute(select(Event).where(Event.id == event_id))
+            event = result.scalar_one_or_none()
+            
+            if not event:
+                await callback.answer("❌ Мероприятие не найдено", show_alert=True)
+                return
+            
+            # Проверяем права доступа
+            user_result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+            user = user_result.scalar_one_or_none()
+            
+            if not user or (user.role not in ['admin', 'moderator'] and user.id != event.creator_id):
+                await callback.answer("❌ У вас нет прав для управления этим мероприятием", show_alert=True)
+                return
+            
+            # Считаем участников
+            participants_result = await session.execute(
+                select(EventRegistration).where(EventRegistration.event_id == event_id)
+            )
+            participants_count = len(participants_result.scalars().all())
+        
+        # Формируем текст с деталями мероприятия (копируем логику из show_event_management_details)
+        now = datetime.now()
+        is_past = event.date_time <= now
+        
+        event_text = f"📅 <b>{event.title}</b>\n"
+        event_text += f"🆔 ID: {event.id}\n\n"
+        
+        event_text += f"📝 <b>Описание:</b> {event.description or 'Не указано'}\n"
+        event_text += f"📍 <b>Место:</b> {event.location or 'Не указано'}\n"
+        event_text += f"🏙️ <b>Город:</b> {event.city}\n"
+        
+        # Статус мероприятия
+        if is_past:
+            event_text += f"🕐 <b>Дата:</b> {event.date_time.strftime('%d.%m.%Y в %H:%M')} ⏰ <i>Прошло</i>\n"
+        else:
+            time_until = event.date_time - now
+            if time_until.days > 0:
+                event_text += f"🕐 <b>Дата:</b> {event.date_time.strftime('%d.%m.%Y в %H:%M')} (через {time_until.days} дн.)\n"
+            elif time_until.seconds > 3600:
+                hours = time_until.seconds // 3600
+                event_text += f"🕐 <b>Дата:</b> {event.date_time.strftime('%d.%m.%Y в %H:%M')} (через {hours} ч.)\n"
+            else:
+                event_text += f"🕐 <b>Дата:</b> {event.date_time.strftime('%d.%m.%Y в %H:%M')} ⚡ <i>Скоро!</i>\n"
+        
+        # Участники
+        if event.max_participants:
+            percentage = (participants_count / event.max_participants) * 100
+            event_text += f"👥 <b>Участники:</b> {participants_count}/{event.max_participants} ({percentage:.0f}%)\n"
+        else:
+            event_text += f"👥 <b>Участники:</b> {participants_count}\n"
+        
+        # Статусы
+        if event.registration_required:
+            status_icon = "🔓" if event.registration_open else "🔒"
+            status_text = "открыта" if event.registration_open else "закрыта"
+            event_text += f"{status_icon} <b>Регистрация:</b> {status_text}\n"
+        else:
+            event_text += "🆓 <b>Регистрация не требуется</b>\n"
+        
+        visibility_icon = "👁" if event.is_visible else "🙈"
+        visibility_text = "видимо" if event.is_visible else "скрыто"
+        event_text += f"{visibility_icon} <b>Видимость:</b> {visibility_text}\n"
+        
+        # Даты создания/обновления
+        event_text += f"\n📅 <b>Создано:</b> {event.created_at.strftime('%d.%m.%Y в %H:%M')}\n"
+        if event.updated_at and event.updated_at != event.created_at:
+            event_text += f"✏️ <b>Обновлено:</b> {event.updated_at.strftime('%d.%m.%Y в %H:%M')}\n"
+        
+        # Клавиатура управления
+        keyboard = []
+        
+        if not is_past:
+            keyboard.extend([
+                [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_event_{event_id}")],
+                [
+                    InlineKeyboardButton(
+                        text="🙈 Скрыть" if event.is_visible else "👁 Показать", 
+                        callback_data=f"toggle_visibility_{event_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🔒 Закрыть рег." if event.registration_open else "🔓 Открыть рег.", 
+                        callback_data=f"toggle_registration_{event_id}"
+                    )
+                ]
+            ])
+        
+        keyboard.extend([
+            [InlineKeyboardButton(text="👥 Участники", callback_data=f"event_participants_{event_id}")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data=f"event_stats_{event_id}")],
+            [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete_event_{event_id}")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="my_created_events")]
+        ])
+        
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        # Отправляем с медиа если есть
+        if event.photo_file_id:
+            await callback.message.answer_photo(
+                photo=event.photo_file_id,
+                caption=event_text,
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+            await callback.message.delete()
+        elif event.video_file_id:
+            await callback.message.answer_video(
+                video=event.video_file_id,
+                caption=event_text,
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+            await callback.message.delete()
+        else:
+            await safe_edit_message(
+                callback,
+                event_text,
+                parse_mode="HTML",
+                reply_markup=markup
+            )
+        
+        await callback.answer("❌ Удаление отменено")
+            
+    except Exception as e:
+        logger.error(f"Ошибка отмены удаления мероприятия {callback.data}: {e}")
+        await safe_edit_message(
+            callback,
+            "❌ Произошла ошибка",
+            reply_markup=get_back_keyboard("my_created_events")
+        )
 
 @router.callback_query(F.data.startswith("toggle_visibility_"))
 async def toggle_event_visibility(callback: CallbackQuery):
@@ -1081,7 +1215,7 @@ async def show_event_participants(callback: CallbackQuery):
 
 @router.callback_query(F.data == "manage_moderators")
 async def show_moderator_management(callback: CallbackQuery):
-    """Управление модераторами (только для админов)"""
+    """Управление ролями пользователей (только для админов)"""
     if not await check_admin_only(callback.from_user.id):
         await callback.answer("❌ Доступно только администраторам", show_alert=True)
         return
@@ -1120,6 +1254,7 @@ async def show_moderator_management(callback: CallbackQuery):
         
         keyboard = [
             [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="add_admin")],
+            [InlineKeyboardButton(text="➖ Удалить администратора", callback_data="remove_admin")],  # Новая кнопка
             [InlineKeyboardButton(text="➕ Добавить модератора", callback_data="add_moderator")],
             [InlineKeyboardButton(text="➖ Удалить модератора", callback_data="remove_moderator")],
             [InlineKeyboardButton(text="📋 Список всех пользователей", callback_data="list_all_users")],
@@ -1134,10 +1269,10 @@ async def show_moderator_management(callback: CallbackQuery):
         )
         
     except Exception as e:
-        logger.error(f"Ошибка управления модераторами: {e}")
+        logger.error(f"Ошибка управления ролями: {e}")
         await callback.answer("❌ Ошибка загрузки", show_alert=True)
 
-@router.callback_query(F.data.in_(["add_admin", "add_moderator", "remove_moderator"]))
+@router.callback_query(F.data.in_(["add_admin", "add_moderator", "remove_moderator", "remove_admin"]))  # Добавил remove_admin
 async def start_manage_admin_action(callback: CallbackQuery, state: FSMContext):
     """Начать действие с администраторами/модераторами"""
     if not await check_admin_only(callback.from_user.id):
@@ -1153,7 +1288,8 @@ async def start_manage_admin_action(callback: CallbackQuery, state: FSMContext):
     action_text = {
         "add_admin": "добавления администратора",
         "add_moderator": "добавления модератора", 
-        "remove_moderator": "удаления модератора"
+        "remove_moderator": "удаления модератора",
+        "remove_admin": "удаления администратора"  # Новое действие
     }
     
     await safe_edit_message(
@@ -1199,13 +1335,26 @@ async def process_admin_user_id(message: Message, state: FSMContext):
                 )
                 return
             
-            # Проверяем, что не пытаемся изменить роль самого себя
-            if user.telegram_id == message.from_user.id and action == "remove_moderator":
+            # Проверяем, что не пытаемся изменить роль самого себя при удалении
+            if user.telegram_id == message.from_user.id and action in ["remove_moderator", "remove_admin"]:
                 await message.answer(
                     "❌ Нельзя удалить роль у самого себя",
                     reply_markup=get_back_keyboard("manage_moderators")
                 )
                 return
+            
+            # Дополнительная проверка: нельзя удалить последнего админа
+            if action == "remove_admin":
+                admins_result = await session.execute(select(User).where(User.role == 'admin'))
+                admins_count = len(admins_result.scalars().all())
+                
+                if admins_count <= 1:
+                    await message.answer(
+                        "❌ Нельзя удалить последнего администратора!\n\n"
+                        "Сначала назначьте другого администратора.",
+                        reply_markup=get_back_keyboard("manage_moderators")
+                    )
+                    return
             
             # Выполняем действие
             old_role = user.role
@@ -1236,6 +1385,17 @@ async def process_admin_user_id(message: Message, state: FSMContext):
                 if user.role != 'moderator':
                     await message.answer(
                         f"❌ Пользователь <b>{user.first_name}</b> не является модератором",
+                        parse_mode="HTML",
+                        reply_markup=get_back_keyboard("manage_moderators")
+                    )
+                    return
+                user.role = 'user'
+                role_name = "обычным пользователем"
+                role_icon = "👤"
+            elif action == "remove_admin":  # Новое действие
+                if user.role != 'admin':
+                    await message.answer(
+                        f"❌ Пользователь <b>{user.first_name}</b> не является администратором",
                         parse_mode="HTML",
                         reply_markup=get_back_keyboard("manage_moderators")
                     )
@@ -1402,8 +1562,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     target_names = {
         "all": "всем пользователям",
         "moscow": "пользователям из Москвы",
-        "kazan": "пользователям из Казани",
-        "event": "участникам мероприятия"
+        "kazan": "пользователям из Казани"
     }
     
     await state.set_state(BroadcastStates.target)
@@ -1413,7 +1572,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     await safe_edit_message(
         callback,
         f"📢 <b>Рассылка {target_names.get(target, 'выбранной группе')}</b>\n\n"
-        f"Введите текст сообщения для рассылки:\n\n"
+        f"📝 Введите текст сообщения для рассылки:\n\n"
         f"💡 <i>Поддерживается HTML разметка</i>\n"
         f"💡 <i>Максимум 4000 символов</i>",
         parse_mode="HTML",
@@ -1432,10 +1591,164 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         )
         return
     
+    await state.update_data(message_text=message.text)
+    await state.set_state(BroadcastStates.media)
+    
+    await message.answer(
+        "📸 <b>Медиафайл</b>\n\n"
+        "Прикрепите фото, GIF или видео к рассылке\n"
+        "(или отправьте <code>-</code> чтобы пропустить):\n\n"
+        "💡 <i>Поддерживаются: фото, анимации (GIF), видео</i>\n"
+        "💡 <i>Максимальный размер видео: 50MB</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+        ])
+    )
+
+@router.message(BroadcastStates.media)
+async def process_broadcast_media(message: Message, state: FSMContext):
+    """Обработка медиафайла для рассылки"""
+    media_file_id = None
+    media_type = None
+    
+    if message.text and message.text.strip() == '-':
+        # Пропускаем медиа
+        pass
+    elif message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_type = 'photo'
+    elif message.animation:  # GIF
+        media_file_id = message.animation.file_id
+        media_type = 'animation'
+    elif message.video:
+        # Проверяем размер видео
+        if message.video.file_size and message.video.file_size > 50 * 1024 * 1024:  # 50MB
+            await message.answer(
+                "❌ Размер видео слишком большой (максимум 50MB).\n"
+                "Попробуйте другое видео или отправьте <code>-</code> чтобы пропустить:",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+                ])
+            )
+            return
+        media_file_id = message.video.file_id
+        media_type = 'video'
+    elif message.text != '-':
+        await message.answer(
+            "❌ Пожалуйста, отправьте фото, GIF, видео или <code>-</code> чтобы пропустить:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+            ])
+        )
+        return
+    
+    await state.update_data(media_file_id=media_file_id, media_type=media_type)
+    await state.set_state(BroadcastStates.schedule_choice)
+    
+    media_text = "Прикреплено" if media_type else "Без медиа"
+    
+    await message.answer(
+        f"⏰ <b>Время отправки</b>\n\n"
+        f"📝 Медиафайл: {media_text}\n\n"
+        f"Когда отправить рассылку?",
+        parse_mode="HTML",
+        reply_markup=get_schedule_keyboard()
+    )
+
+@router.callback_query(F.data.startswith("schedule_"))
+async def process_schedule_choice(callback: CallbackQuery, state: FSMContext):
+    """Обработка выбора времени отправки"""
+    schedule_type = callback.data.split("_")[1]
+    
+    if schedule_type == "now":
+        await state.update_data(scheduled_time=None)
+        await show_broadcast_confirmation(callback, state)
+    elif schedule_type == "later":
+        await state.set_state(BroadcastStates.schedule_time)
+        
+        current_time = datetime.now()
+        
+        await safe_edit_message(
+            callback,
+            f"⏰ <b>Планирование рассылки</b>\n\n"
+            f"Введите дату и время отправки в формате:\n"
+            f"<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
+            f"Например: <code>25.12.2024 18:30</code>\n\n"
+            f"🕐 Текущее время: {current_time.strftime('%d.%m.%Y %H:%M')}\n"
+            f"💡 Минимальное время: через 5 минут",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="schedule_now")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+            ])
+        )
+
+@router.message(BroadcastStates.schedule_time)
+async def process_schedule_time(message: Message, state: FSMContext):
+    """Обработка запланированного времени"""
+    try:
+        scheduled_time = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
+        
+        # Проверяем, что время в будущем (минимум через 5 минут)
+        min_time = datetime.now() + timedelta(minutes=5)
+        if scheduled_time <= min_time:
+            await message.answer(
+                f"❌ Время должно быть минимум через 5 минут от текущего времени.\n"
+                f"Текущее время: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+                "Попробуйте еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data="schedule_now")],
+                    [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+                ])
+            )
+            return
+        
+        # Проверяем максимальное время (не более чем через месяц)
+        max_time = datetime.now() + timedelta(days=30)
+        if scheduled_time > max_time:
+            await message.answer(
+                "❌ Нельзя запланировать рассылку более чем на месяц вперед.\n"
+                "Попробуйте еще раз:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data="schedule_now")],
+                    [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+                ])
+            )
+            return
+        
+        await state.update_data(scheduled_time=scheduled_time)
+        
+        # Создаем callback для показа подтверждения
+        fake_callback = type('obj', (object,), {
+            'message': message,
+            'from_user': message.from_user,
+            'answer': lambda text="", show_alert=False: asyncio.create_task(message.answer(""))
+        })()
+        
+        await show_broadcast_confirmation(fake_callback, state, is_message=True)
+        
+    except ValueError:
+        await message.answer(
+            "❌ Неверный формат даты. Используйте: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+            "Например: <code>25.12.2024 18:30</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data="schedule_now")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
+            ])
+        )
+
+async def show_broadcast_confirmation(callback_or_message, state: FSMContext, is_message=False):
+    """Показать подтверждение рассылки"""
     data = await state.get_data()
     target = data['target']
-    
-    await state.update_data(message_text=message.text)
+    message_text = data['message_text']
+    media_type = data.get('media_type')
+    media_file_id = data.get('media_file_id')
+    scheduled_time = data.get('scheduled_time')
     
     # Получаем количество получателей
     try:
@@ -1461,17 +1774,33 @@ async def process_broadcast_message(message: Message, state: FSMContext):
     target_names = {
         "all": "всем пользователям",
         "moscow": "пользователям из Москвы",
-        "kazan": "пользователям из Казани",
-        "event": "участникам мероприятия"
+        "kazan": "пользователям из Казани"
     }
     
-    preview_text = message.text[:200] + "..." if len(message.text) > 200 else message.text
+    # Предварительный просмотр сообщения
+    preview_text = message_text[:150] + "..." if len(message_text) > 150 else message_text
     
     confirmation_text = f"📢 <b>Подтверждение рассылки</b>\n\n"
     confirmation_text += f"🎯 <b>Получатели:</b> {target_names.get(target)}\n"
-    confirmation_text += f"👥 <b>Количество:</b> {recipients_count}\n\n"
-    confirmation_text += f"📝 <b>Предварительный просмотр:</b>\n"
-    confirmation_text += f"<i>{preview_text}</i>\n\n"
+    confirmation_text += f"👥 <b>Количество:</b> {recipients_count}\n"
+    confirmation_text += f"📸 <b>Медиа:</b> {'Да' if media_type else 'Нет'}\n"
+    
+    if scheduled_time:
+        time_until = scheduled_time - datetime.now()
+        if time_until.days > 0:
+            time_text = f"через {time_until.days} дн."
+        elif time_until.seconds > 3600:
+            hours = time_until.seconds // 3600
+            time_text = f"через {hours} ч."
+        else:
+            minutes = time_until.seconds // 60
+            time_text = f"через {minutes} мин."
+        
+        confirmation_text += f"⏰ <b>Время:</b> {scheduled_time.strftime('%d.%m.%Y в %H:%M')} ({time_text})\n"
+    else:
+        confirmation_text += f"⏰ <b>Время:</b> Сейчас\n"
+    
+    confirmation_text += f"\n📝 <b>Предварительный просмотр:</b>\n<i>{preview_text}</i>\n\n"
     confirmation_text += f"❓ Отправить рассылку?"
     
     keyboard = [
@@ -1479,11 +1808,19 @@ async def process_broadcast_message(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")]
     ]
     
-    await message.answer(
-        confirmation_text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-    )
+    if is_message:
+        await callback_or_message.answer(
+            confirmation_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+    else:
+        await safe_edit_message(
+            callback_or_message,
+            confirmation_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
 
 @router.callback_query(F.data == "confirm_broadcast")
 async def execute_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -1497,73 +1834,117 @@ async def execute_broadcast(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     target = data['target']
     message_text = data['message_text']
+    media_type = data.get('media_type')
+    media_file_id = data.get('media_file_id')
+    scheduled_time = data.get('scheduled_time')
     
-    await safe_edit_message(
-        callback,
-        "📤 <b>Рассылка запущена...</b>\n\n"
-        "Подождите, это может занять некоторое время.",
-        parse_mode="HTML"
-    )
-    
-    try:
-        async with async_session() as session:
-            # Получаем получателей
-            if target == "all":
-                result = await session.execute(select(User))
-            elif target == "moscow":
-                result = await session.execute(select(User).where(User.city == "Москва"))
-            elif target == "kazan":
-                result = await session.execute(select(User).where(User.city == "Казань"))
-            else:
-                result = await session.execute(select(User))
-            
-            recipients = result.scalars().all()
-        
-        # Выполняем рассылку
-        success_count = 0
-        error_count = 0
-        
-        for user in recipients:
-            try:
-                await callback.bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=f"📢 <b>Рассылка от администрации</b>\n\n{message_text}",
-                    parse_mode="HTML"
-                )
-                success_count += 1
-                
-                # Небольшая задержка для избежания лимитов
-                if success_count % 30 == 0:
-                    await asyncio.sleep(1)
-                    
-            except Exception as e:
-                error_count += 1
-                logger.warning(f"Не удалось отправить сообщение пользователю {user.telegram_id}: {e}")
-        
-        result_text = f"✅ <b>Рассылка завершена</b>\n\n"
-        result_text += f"📤 Отправлено: {success_count}\n"
-        if error_count > 0:
-            result_text += f"❌ Ошибок: {error_count}\n"
-        result_text += f"👥 Всего получателей: {len(recipients)}"
-        
+    if scheduled_time:
+        # Запланированная рассылка
         await safe_edit_message(
             callback,
-            result_text,
+            f"⏰ <b>Рассылка запланирована</b>\n\n"
+            f"📅 Время отправки: {scheduled_time.strftime('%d.%m.%Y в %H:%M')}\n\n"
+            f"📝 Рассылка будет отправлена автоматически в указанное время.\n"
+            f"💡 <i>Функция отложенной рассылки будет реализована в следующих версиях</i>",
             parse_mode="HTML",
             reply_markup=get_back_keyboard("broadcast")
         )
         
-        logger.info(f"Рассылка выполнена пользователем {callback.from_user.id}: {success_count} успешно, {error_count} ошибок")
+        # TODO: Здесь можно добавить сохранение в БД для отложенной рассылки
+        logger.info(f"Запланирована рассылка на {scheduled_time} пользователем {callback.from_user.id}")
         
-    except Exception as e:
-        logger.error(f"Ошибка выполнения рассылки: {e}")
+    else:
+        # Немедленная рассылка
         await safe_edit_message(
             callback,
-            "❌ Произошла ошибка при выполнении рассылки",
-            reply_markup=get_back_keyboard("broadcast")
+            "📤 <b>Рассылка запущена...</b>\n\n"
+            "Подождите, это может занять некоторое время.",
+            parse_mode="HTML"
         )
-    finally:
-        await state.clear()
+        
+        try:
+            async with async_session() as session:
+                # Получаем получателей
+                if target == "all":
+                    result = await session.execute(select(User))
+                elif target == "moscow":
+                    result = await session.execute(select(User).where(User.city == "Москва"))
+                elif target == "kazan":
+                    result = await session.execute(select(User).where(User.city == "Казань"))
+                else:
+                    result = await session.execute(select(User))
+                
+                recipients = result.scalars().all()
+            
+            # Выполняем рассылку
+            success_count = 0
+            error_count = 0
+            
+            for user in recipients:
+                try:
+                    # Отправляем только введенный текст без префикса
+                    if media_type == 'photo':
+                        await callback.bot.send_photo(
+                            chat_id=user.telegram_id,
+                            photo=media_file_id,
+                            caption=message_text,
+                            parse_mode="HTML"
+                        )
+                    elif media_type == 'animation':
+                        await callback.bot.send_animation(
+                            chat_id=user.telegram_id,
+                            animation=media_file_id,
+                            caption=message_text,
+                            parse_mode="HTML"
+                        )
+                    elif media_type == 'video':
+                        await callback.bot.send_video(
+                            chat_id=user.telegram_id,
+                            video=media_file_id,
+                            caption=message_text,
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await callback.bot.send_message(
+                            chat_id=user.telegram_id,
+                            text=message_text,
+                            parse_mode="HTML"
+                        )
+                    
+                    success_count += 1
+                    
+                    # Небольшая задержка для избежания лимитов
+                    if success_count % 30 == 0:
+                        await asyncio.sleep(1)
+                        
+                except Exception as e:
+                    error_count += 1
+                    logger.warning(f"Не удалось отправить сообщение пользователю {user.telegram_id}: {e}")
+            
+            result_text = f"✅ <b>Рассылка завершена</b>\n\n"
+            result_text += f"📤 Отправлено: {success_count}\n"
+            if error_count > 0:
+                result_text += f"❌ Ошибок: {error_count}\n"
+            result_text += f"👥 Всего получателей: {len(recipients)}"
+            
+            await safe_edit_message(
+                callback,
+                result_text,
+                parse_mode="HTML",
+                reply_markup=get_back_keyboard("broadcast")
+            )
+            
+            logger.info(f"Рассылка выполнена пользователем {callback.from_user.id}: {success_count} успешно, {error_count} ошибок")
+            
+        except Exception as e:
+            logger.error(f"Ошибка выполнения рассылки: {e}")
+            await safe_edit_message(
+                callback,
+                "❌ Произошла ошибка при выполнении рассылки",
+                reply_markup=get_back_keyboard("broadcast")
+            )
+    
+    await state.clear()
 
 @router.callback_query(F.data == "user_questions")
 async def show_user_questions(callback: CallbackQuery):
@@ -1588,51 +1969,6 @@ async def show_user_questions(callback: CallbackQuery):
         reply_markup=get_back_keyboard("admin_panel")
     )
     
-    try:
-        field_names = {
-            'title': 'Название',
-            'description': 'Описание',
-            'location': 'Место',
-            'city': 'Город',
-            'datetime': 'Дата и время',
-            'limit': 'Лимит участников'
-        }
-        
-        new_display_value = new_value
-        if field == 'description' and new_value == '-':
-            new_display_value = "Удалено"
-        elif field == 'location' and new_value == '-':
-            new_display_value = "Удалено"
-        elif field == 'limit' and new_value == '-':
-            new_display_value = "Неограниченно"
-        elif field == 'datetime':
-            new_display_value = datetime_obj.strftime('%d.%m.%Y в %H:%M')
-        
-        success_text = f"✅ <b>Поле обновлено</b>\n\n"
-        success_text += f"📅 <b>Мероприятие:</b> {event.title}\n"
-        success_text += f"🔧 <b>Поле:</b> {field_names.get(field)}\n"
-        success_text += f"📝 <b>Было:</b> {old_value}\n"
-        success_text += f"✨ <b>Стало:</b> {new_display_value}"
-        
-        await message.answer(
-            success_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✏️ Продолжить редактирование", callback_data=f"edit_event_{event_id}")],
-                [InlineKeyboardButton(text="📋 К мероприятию", callback_data=f"manage_event_{event_id}")]
-            ])
-        )
-        
-        logger.info(f"Мероприятие {event_id} отредактировано пользователем {message.from_user.id}: {field} = {new_value}")
-        
-    except Exception as e:
-        logger.error(f"Ошибка редактирования мероприятия: {e}")
-        await message.answer(
-            "❌ Произошла ошибка при редактировании",
-            reply_markup=get_back_keyboard(f"manage_event_{event_id}")
-        )
-    finally:
-        await state.clear()
 
 # Добавляем обработчик просмотра всех мероприятий для админов
 @router.callback_query(F.data == "all_events_manage")
@@ -1839,6 +2175,401 @@ async def generate_export(callback: CallbackQuery):
             "❌ Произошла ошибка при генерации отчета",
             reply_markup=get_back_keyboard("export_data")
         )
+
+@router.callback_query(F.data.startswith("edit_event_"))
+async def start_edit_event(callback: CallbackQuery, state: FSMContext):
+    """Начать редактирование мероприятия"""
+    try:
+        event_id = int(callback.data.split("_")[2])
+        
+        async with async_session() as session:
+            result = await session.execute(select(Event).where(Event.id == event_id))
+            event = result.scalar_one_or_none()
+            
+            if not event:
+                await callback.answer("❌ Мероприятие не найдено", show_alert=True)
+                return
+            
+            # Проверяем права доступа
+            user_result = await session.execute(select(User).where(User.telegram_id == callback.from_user.id))
+            user = user_result.scalar_one_or_none()
+            
+            if not user or (user.role not in ['admin', 'moderator'] and user.id != event.creator_id):
+                await callback.answer("❌ У вас нет прав для редактирования этого мероприятия", show_alert=True)
+                return
+        
+        await state.set_state(EditEventStates.event_id)
+        await state.update_data(event_id=event_id)
+        
+        edit_text = f"✏️ <b>Редактирование мероприятия</b>\n\n"
+        edit_text += f"📅 <b>{event.title}</b>\n\n"
+        edit_text += f"Выберите поле для редактирования:"
+        
+        keyboard = [
+            [InlineKeyboardButton(text="📝 Название", callback_data=f"edit_field_{event_id}_title")],
+            [InlineKeyboardButton(text="📄 Описание", callback_data=f"edit_field_{event_id}_description")],
+            [InlineKeyboardButton(text="📍 Место", callback_data=f"edit_field_{event_id}_location")],
+            [InlineKeyboardButton(text="🏙️ Город", callback_data=f"edit_field_{event_id}_city")],
+            [InlineKeyboardButton(text="🕐 Дата и время", callback_data=f"edit_field_{event_id}_datetime")],
+            [InlineKeyboardButton(text="👥 Лимит участников", callback_data=f"edit_field_{event_id}_limit")],
+            [InlineKeyboardButton(text="📸 Медиафайл", callback_data=f"edit_field_{event_id}_media")],
+            [InlineKeyboardButton(text="🔙 Назад к мероприятию", callback_data=f"manage_event_{event_id}")]
+        ]
+        
+        await safe_edit_message(
+            callback,
+            edit_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка начала редактирования мероприятия: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_field_"))
+async def select_edit_field(callback: CallbackQuery, state: FSMContext):
+    """Выбор поля для редактирования"""
+    try:
+        parts = callback.data.split("_")
+        event_id = int(parts[2])
+        field = parts[3]
+        
+        await state.update_data(event_id=event_id, field=field)
+        await state.set_state(EditEventStates.value)
+        
+        async with async_session() as session:
+            result = await session.execute(select(Event).where(Event.id == event_id))
+            event = result.scalar_one_or_none()
+            
+            if not event:
+                await callback.answer("❌ Мероприятие не найдено", show_alert=True)
+                return
+        
+        field_info = {
+            'title': {
+                'name': 'Название',
+                'current': event.title,
+                'instruction': 'Введите новое название мероприятия:',
+                'max_length': 255
+            },
+            'description': {
+                'name': 'Описание',
+                'current': event.description or 'Не указано',
+                'instruction': 'Введите новое описание мероприятия\n(или отправьте <code>-</code> чтобы удалить):',
+                'max_length': None
+            },
+            'location': {
+                'name': 'Место проведения',
+                'current': event.location or 'Не указано',
+                'instruction': 'Введите новое место проведения\n(или отправьте <code>-</code> чтобы удалить):',
+                'max_length': 255
+            },
+            'city': {
+                'name': 'Город',
+                'current': event.city,
+                'instruction': 'Выберите новый город:',
+                'max_length': None
+            },
+            'datetime': {
+                'name': 'Дата и время',
+                'current': event.date_time.strftime('%d.%m.%Y %H:%M'),
+                'instruction': 'Введите новую дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\nНапример: <code>25.12.2024 18:30</code>',
+                'max_length': None
+            },
+            'limit': {
+                'name': 'Лимит участников',
+                'current': str(event.max_participants) if event.max_participants else 'Неограниченно',
+                'instruction': 'Введите новый лимит участников\n(или отправьте <code>-</code> для неограниченного количества):',
+                'max_length': None
+            },
+            'media': {
+                'name': 'Медиафайл',
+                'current': f"{'Фото' if event.photo_file_id else 'Видео' if event.video_file_id else 'Не прикреплено'}",
+                'instruction': 'Отправьте новое фото или видео\n(или отправьте <code>-</code> чтобы удалить медиа):',
+                'max_length': None
+            }
+        }
+        
+        info = field_info.get(field)
+        if not info:
+            await callback.answer("❌ Неизвестное поле", show_alert=True)
+            return
+        
+        if field == 'city':
+            # Специальная обработка для города
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏢 Москва", callback_data=f"edit_city_{event_id}_moscow")],
+                [InlineKeyboardButton(text="🕌 Казань", callback_data=f"edit_city_{event_id}_kazan")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data=f"edit_event_{event_id}")]
+            ])
+            
+            await safe_edit_message(
+                callback,
+                f"🏙️ <b>Редактирование города</b>\n\n"
+                f"📅 <b>Мероприятие:</b> {event.title}\n"
+                f"🔄 <b>Текущий город:</b> {info['current']}\n\n"
+                f"{info['instruction']}",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        else:
+            edit_text = f"✏️ <b>Редактирование: {info['name']}</b>\n\n"
+            edit_text += f"📅 <b>Мероприятие:</b> {event.title}\n"
+            edit_text += f"🔄 <b>Текущее значение:</b> {info['current']}\n\n"
+            edit_text += f"{info['instruction']}"
+            
+            if info['max_length']:
+                edit_text += f"\n\n💡 <i>Максимум {info['max_length']} символов</i>"
+            
+            await safe_edit_message(
+                callback,
+                edit_text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="❌ Отменить", callback_data=f"edit_event_{event_id}")]
+                ])
+            )
+        
+    except Exception as e:
+        logger.error(f"Ошибка выбора поля для редактирования: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@router.callback_query(F.data.startswith("edit_city_"))
+async def edit_event_city(callback: CallbackQuery, state: FSMContext):
+    """Редактирование города мероприятия"""
+    try:
+        parts = callback.data.split("_")
+        event_id = int(parts[2])
+        city_code = parts[3]
+        new_city = "Москва" if city_code == "moscow" else "Казань"
+        
+        async with async_session() as session:
+            result = await session.execute(select(Event).where(Event.id == event_id))
+            event = result.scalar_one_or_none()
+            
+            if not event:
+                await callback.answer("❌ Мероприятие не найдено", show_alert=True)
+                return
+            
+            old_city = event.city
+            event.city = new_city
+            event.updated_at = datetime.now()
+            await session.commit()
+        
+        await state.clear()
+        
+        success_text = f"✅ <b>Город обновлен</b>\n\n"
+        success_text += f"📅 <b>Мероприятие:</b> {event.title}\n"
+        success_text += f"🔧 <b>Поле:</b> Город\n"
+        success_text += f"📝 <b>Было:</b> {old_city}\n"
+        success_text += f"✨ <b>Стало:</b> {new_city}"
+        
+        await safe_edit_message(
+            callback,
+            success_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Продолжить редактирование", callback_data=f"edit_event_{event_id}")],
+                [InlineKeyboardButton(text="📋 К мероприятию", callback_data=f"manage_event_{event_id}")]
+            ])
+        )
+        
+        logger.info(f"Город мероприятия {event_id} изменен с {old_city} на {new_city} пользователем {callback.from_user.id}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка редактирования города: {e}")
+        await callback.answer("❌ Ошибка", show_alert=True)
+
+@router.message(EditEventStates.value)
+async def process_edit_value(message: Message, state: FSMContext):
+    """Обработка нового значения поля"""
+    try:
+        data = await state.get_data()
+        event_id = data['event_id']
+        field = data['field']
+        new_value = message.text.strip()
+        
+        async with async_session() as session:
+            result = await session.execute(select(Event).where(Event.id == event_id))
+            event = result.scalar_one_or_none()
+            
+            if not event:
+                await message.answer("❌ Мероприятие не найдено")
+                await state.clear()
+                return
+            
+            # Получаем старое значение для лога
+            old_value = getattr(event, field) if hasattr(event, field) else None
+            if field == 'datetime':
+                old_value = event.date_time.strftime('%d.%m.%Y %H:%M')
+            elif field == 'limit':
+                old_value = str(event.max_participants) if event.max_participants else 'Неограниченно'
+            elif field == 'media':
+                if event.photo_file_id:
+                    old_value = "Фото"
+                elif event.video_file_id:
+                    old_value = "Видео"
+                else:
+                    old_value = "Не прикреплено"
+            
+            # Валидация и обновление по полям
+            if field == 'title':
+                if len(new_value) > 255:
+                    await message.answer(
+                        "❌ Название слишком длинное (максимум 255 символов)",
+                        reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                    )
+                    return
+                event.title = new_value
+                
+            elif field == 'description':
+                event.description = None if new_value == '-' else new_value
+                
+            elif field == 'location':
+                event.location = None if new_value == '-' else new_value
+                
+            elif field == 'datetime':
+                try:
+                    datetime_obj = datetime.strptime(new_value, "%d.%m.%Y %H:%M")
+                    
+                    # Проверяем, что дата в будущем
+                    min_time = datetime.now() + timedelta(hours=1)
+                    if datetime_obj <= min_time:
+                        await message.answer(
+                            "❌ Дата должна быть минимум через час от текущего времени",
+                            reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                        )
+                        return
+                    
+                    # Проверяем максимальную дату
+                    max_time = datetime.now() + timedelta(days=365)
+                    if datetime_obj > max_time:
+                        await message.answer(
+                            "❌ Дата не может быть более чем через год",
+                            reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                        )
+                        return
+                    
+                    event.date_time = datetime_obj
+                    
+                except ValueError:
+                    await message.answer(
+                        "❌ Неверный формат даты. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ",
+                        reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                    )
+                    return
+                    
+            elif field == 'limit':
+                if new_value == '-':
+                    event.max_participants = None
+                else:
+                    try:
+                        limit = int(new_value)
+                        if limit <= 0:
+                            await message.answer(
+                                "❌ Лимит должен быть положительным числом",
+                                reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                            )
+                            return
+                        if limit > 10000:
+                            await message.answer(
+                                "❌ Слишком большой лимит (максимум 10000)",
+                                reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                            )
+                            return
+                        event.max_participants = limit
+                    except ValueError:
+                        await message.answer(
+                            "❌ Введите число или '-' для неограниченного количества",
+                            reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                        )
+                        return
+                        
+            elif field == 'media':
+                if new_value == '-':
+                    # Удаляем медиа
+                    event.photo_file_id = None
+                    event.video_file_id = None
+                    event.media_type = None
+                elif message.photo:
+                    # Обновляем фото
+                    event.photo_file_id = message.photo[-1].file_id
+                    event.video_file_id = None
+                    event.media_type = 'photo'
+                elif message.video:
+                    # Проверяем размер видео
+                    if message.video.file_size and message.video.file_size > 50 * 1024 * 1024:
+                        await message.answer(
+                            "❌ Размер видео слишком большой (максимум 50MB)",
+                            reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                        )
+                        return
+                    event.video_file_id = message.video.file_id
+                    event.photo_file_id = None
+                    event.media_type = 'video'
+                else:
+                    await message.answer(
+                        "❌ Отправьте фото, видео или '-' для удаления медиа",
+                        reply_markup=get_back_keyboard(f"edit_event_{event_id}")
+                    )
+                    return
+            
+            event.updated_at = datetime.now()
+            await session.commit()
+        
+        # Формируем сообщение об успехе
+        field_names = {
+            'title': 'Название',
+            'description': 'Описание',
+            'location': 'Место',
+            'datetime': 'Дата и время',
+            'limit': 'Лимит участников',
+            'media': 'Медиафайл'
+        }
+        
+        new_display_value = new_value
+        if field == 'description' and new_value == '-':
+            new_display_value = "Удалено"
+        elif field == 'location' and new_value == '-':
+            new_display_value = "Удалено"
+        elif field == 'limit' and new_value == '-':
+            new_display_value = "Неограниченно"
+        elif field == 'datetime':
+            new_display_value = datetime_obj.strftime('%d.%m.%Y в %H:%M')
+        elif field == 'media':
+            if new_value == '-':
+                new_display_value = "Удалено"
+            elif message.photo:
+                new_display_value = "Фото обновлено"
+            elif message.video:
+                new_display_value = "Видео обновлено"
+        
+        success_text = f"✅ <b>Поле обновлено</b>\n\n"
+        success_text += f"📅 <b>Мероприятие:</b> {event.title}\n"
+        success_text += f"🔧 <b>Поле:</b> {field_names.get(field)}\n"
+        success_text += f"📝 <b>Было:</b> {old_value or 'Не указано'}\n"
+        success_text += f"✨ <b>Стало:</b> {new_display_value}"
+        
+        await message.answer(
+            success_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✏️ Продолжить редактирование", callback_data=f"edit_event_{event_id}")],
+                [InlineKeyboardButton(text="📋 К мероприятию", callback_data=f"manage_event_{event_id}")]
+            ])
+        )
+        
+        logger.info(f"Мероприятие {event_id} отредактировано пользователем {message.from_user.id}: {field} = {new_display_value}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка редактирования мероприятия: {e}")
+        await message.answer(
+            "❌ Произошла ошибка при редактировании",
+            reply_markup=get_back_keyboard(f"manage_event_{event_id}")
+        )
+    finally:
+        await state.clear()
 
 # Обработчики отмены для всех состояний
 @router.callback_query(F.data == "admin_panel")

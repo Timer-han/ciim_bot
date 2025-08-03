@@ -48,7 +48,7 @@ def get_admin_panel_keyboard(role: str):
     ]
     
     if role == 'admin':
-        keyboard.append([InlineKeyboardButton(text="👥 Управление модераторами", callback_data="manage_moderators")])
+        keyboard.append([InlineKeyboardButton(text="👥 Управление ролями", callback_data="manage_moderators")])  # Изменил текст
     
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
     
@@ -88,8 +88,16 @@ def get_broadcast_keyboard():
         [InlineKeyboardButton(text="👥 Всем пользователям", callback_data="broadcast_all")],
         [InlineKeyboardButton(text="🏢 По Москве", callback_data="broadcast_moscow")],
         [InlineKeyboardButton(text="🕌 По Казани", callback_data="broadcast_kazan")],
-        [InlineKeyboardButton(text="📅 По мероприятию", callback_data="broadcast_event")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
+    ])
+    return keyboard
+
+def get_schedule_keyboard():
+    """Клавиатура выбора времени отправки"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Отправить сейчас", callback_data="schedule_now")],
+        [InlineKeyboardButton(text="⏰ Запланировать", callback_data="schedule_later")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="broadcast")]
     ])
     return keyboard
 
@@ -141,3 +149,31 @@ def get_cancel_keyboard():
         [InlineKeyboardButton(text="❌ Отменить", callback_data="admin_panel")]
     ])
     return keyboard
+
+def get_next_event_keyboard(event_id: int = None, show_all: bool = True):
+    """Клавиатура для ближайшего мероприятия"""
+    keyboard = []
+    
+    if event_id:
+        keyboard.append([InlineKeyboardButton(text="📝 Подробнее", callback_data=f"event_{event_id}")])
+    
+    if show_all:
+        keyboard.append([InlineKeyboardButton(text="📅 Все мероприятия", callback_data="all_events")])
+    
+    keyboard.extend([
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="show_profile")],
+        [InlineKeyboardButton(text="🏙️ Выбрать город", callback_data="select_city_inline")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="show_main_menu")]
+    ])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_no_events_keyboard():
+    """Клавиатура когда нет мероприятий"""
+    keyboard = [
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="show_profile")],
+        [InlineKeyboardButton(text="🏙️ Выбрать город", callback_data="select_city_inline")],
+        [InlineKeyboardButton(text="📋 Меню", callback_data="show_main_menu")]
+    ]
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
