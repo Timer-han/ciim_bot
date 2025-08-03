@@ -32,7 +32,7 @@ def get_events_keyboard(user_city: str = None):
     
     if user_city:
         keyboard.inline_keyboard.insert(0, 
-            [InlineKeyboardButton(text=f"📍 Мероприятия в {user_city}", callback_data=f"events_city_{user_city.lower()}")]
+            [InlineKeyboardButton(text=f"📍 Мероприятия в городе {user_city}", callback_data=f"events_city_{user_city.lower()}")]
         )
     
     keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")])
