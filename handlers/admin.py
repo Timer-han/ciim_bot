@@ -142,6 +142,28 @@ async def get_events_stats() -> dict:
     except Exception as e:
         logger.error(f"Ошибка получения статистики мероприятий: {e}")
         return {}
+    
+async def safe_edit_message(callback: CallbackQuery, text: str, reply_markup=None, parse_mode="HTML"):
+    """Безопасное редактирование сообщения с fallback на удаление и отправку нового"""
+    try:
+        await callback.message.edit_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup
+        )
+    except Exception:
+        # Если не получается отредактировать, удаляем и отправляем новое
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        
+        await callback.message.answer(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup
+        )
+
 
 @router.message(F.text == "⚙️ Панель управления")
 async def show_admin_panel(message: Message):
@@ -206,7 +228,8 @@ async def show_admin_panel_callback(callback: CallbackQuery):
         stats_text += f"📅 Мероприятий: {event_stats.get('upcoming', 0)} предстоящих\n"
         stats_text += f"✅ Регистраций: {event_stats.get('registrations', 0)}\n"
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         stats_text,
         parse_mode="HTML",
         reply_markup=get_admin_panel_keyboard(role)
@@ -222,7 +245,8 @@ async def start_create_event(callback: CallbackQuery, state: FSMContext):
         return
     
     await state.set_state(CreateEventStates.title)
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         "📝 <b>Создание нового мероприятия</b>\n\n"
         "Шаг 1/7: Введите название мероприятия:",
         parse_mode="HTML",
@@ -291,7 +315,8 @@ async def process_event_city_callback(callback: CallbackQuery, state: FSMContext
     await state.update_data(city=city)
     await state.set_state(CreateEventStates.date_time)
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         f"✅ Выбран город: <b>{city}</b>\n\n"
         "📅 <b>Шаг 5/7:</b> Введите дату и время мероприятия\n\n"
         "Формат: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
@@ -399,7 +424,8 @@ async def process_registration_required(callback: CallbackQuery, state: FSMConte
     await state.set_state(CreateEventStates.media)
     
     reg_text = "требуется" if registration_required else "не требуется"
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         f"✅ Регистрация: <b>{reg_text}</b>\n\n"
         "📸 <b>Финальный шаг:</b> Прикрепите фото или видео к мероприятию\n"
         "(или отправьте <code>-</code> чтобы пропустить):",
@@ -520,31 +546,6 @@ async def process_event_media(message: Message, state: FSMContext):
     finally:
         await state.clear()
 
-@router.callback_query(F.data == "manage_events")
-async def show_event_management(callback: CallbackQuery):
-    """Показать управление мероприятиями"""
-    has_access, role = await check_admin_or_moderator(callback.from_user.id)
-    
-    if not has_access:
-        await callback.answer("❌ У вас нет доступа", show_alert=True)
-        return
-    
-    # Добавляем статистику мероприятий
-    stats = await get_events_stats()
-    
-    text = "📝 <b>Управление мероприятиями</b>\n\n"
-    if stats:
-        text += f"📊 Всего мероприятий: {stats.get('total', 0)}\n"
-        text += f"🔜 Предстоящих: {stats.get('upcoming', 0)}\n"
-        text += f"✅ Регистраций: {stats.get('registrations', 0)}\n\n"
-    
-    text += "Выберите действие:"
-    
-    await callback.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=get_event_management_keyboard()
-    )
 
 @router.callback_query(F.data == "my_created_events")
 async def show_my_created_events(callback: CallbackQuery):
@@ -568,14 +569,16 @@ async def show_my_created_events(callback: CallbackQuery):
             events = events_result.scalars().all()
         
         if not events:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback,
                 "📝 У вас пока нет созданных мероприятий\n\n"
                 "Используйте кнопку 'Создать мероприятие' для создания первого мероприятия.",
                 reply_markup=get_back_keyboard("manage_events")
             )
             return
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             f"📋 <b>Ваши мероприятия</b> ({len(events)}):",
             parse_mode="HTML",
             reply_markup=build_events_list_keyboard(events, "manage_event")
@@ -605,7 +608,8 @@ async def show_broadcast_menu(callback: CallbackQuery):
     
     text += "Выберите целевую аудиторию:"
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         text,
         parse_mode="HTML",
         reply_markup=get_broadcast_keyboard()
@@ -734,7 +738,8 @@ async def show_event_management_details(callback: CallbackQuery):
             )
             await callback.message.delete()
         else:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback,
                 event_text,
                 parse_mode="HTML",
                 reply_markup=markup
@@ -833,7 +838,8 @@ async def show_event_statistics(callback: CallbackQuery):
             [InlineKeyboardButton(text="🔙 Назад к мероприятию", callback_data=f"manage_event_{event_id}")]
         ]
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             stats_text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -871,7 +877,8 @@ async def confirm_delete_event(callback: CallbackQuery):
         warning_text += f"❗️ <b>Это действие нельзя отменить!</b>\n"
         warning_text += f"Все регистрации будут удалены."
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             warning_text,
             parse_mode="HTML",
             reply_markup=get_confirmation_keyboard("delete_event", event_id)
@@ -913,7 +920,8 @@ async def delete_event_confirmed(callback: CallbackQuery):
         
         logger.info(f"Удалено мероприятие {event_id} '{event_title}' пользователем {callback.from_user.id}")
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             f"✅ <b>Мероприятие удалено</b>\n\n"
             f"📅 {event_title}\n"
             f"🗑️ Удалено {len(registrations)} регистраций",
@@ -923,7 +931,8 @@ async def delete_event_confirmed(callback: CallbackQuery):
         
     except Exception as e:
         logger.error(f"Ошибка удаления мероприятия {callback.data}: {e}")
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             "❌ Произошла ошибка при удалении мероприятия",
             reply_markup=get_back_keyboard("my_created_events")
         )
@@ -1059,7 +1068,8 @@ async def show_event_participants(callback: CallbackQuery):
             [InlineKeyboardButton(text="🔙 Назад к мероприятию", callback_data=f"manage_event_{event_id}")]
         ]
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1116,7 +1126,8 @@ async def show_moderator_management(callback: CallbackQuery):
             [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
         ]
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             text,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -1145,7 +1156,8 @@ async def start_manage_admin_action(callback: CallbackQuery, state: FSMContext):
         "remove_moderator": "удаления модератора"
     }
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         f"🆔 <b>Управление ролями</b>\n\n"
         f"Для {action_text[action]} введите Telegram ID пользователя:\n\n"
         f"💡 <i>Чтобы узнать ID, пользователь может написать @userinfobot</i>\n"
@@ -1276,7 +1288,8 @@ async def show_all_users_list(callback: CallbackQuery):
             users = result.scalars().all()
         
         if not users:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback,
                 "📋 Список пользователей пуст",
                 reply_markup=get_back_keyboard("manage_moderators")
             )
@@ -1397,7 +1410,8 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     await state.update_data(target=target)
     await state.set_state(BroadcastStates.message_text)
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         f"📢 <b>Рассылка {target_names.get(target, 'выбранной группе')}</b>\n\n"
         f"Введите текст сообщения для рассылки:\n\n"
         f"💡 <i>Поддерживается HTML разметка</i>\n"
@@ -1484,7 +1498,8 @@ async def execute_broadcast(callback: CallbackQuery, state: FSMContext):
     target = data['target']
     message_text = data['message_text']
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         "📤 <b>Рассылка запущена...</b>\n\n"
         "Подождите, это может занять некоторое время.",
         parse_mode="HTML"
@@ -1531,7 +1546,8 @@ async def execute_broadcast(callback: CallbackQuery, state: FSMContext):
             result_text += f"❌ Ошибок: {error_count}\n"
         result_text += f"👥 Всего получателей: {len(recipients)}"
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             result_text,
             parse_mode="HTML",
             reply_markup=get_back_keyboard("broadcast")
@@ -1541,7 +1557,8 @@ async def execute_broadcast(callback: CallbackQuery, state: FSMContext):
         
     except Exception as e:
         logger.error(f"Ошибка выполнения рассылки: {e}")
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             "❌ Произошла ошибка при выполнении рассылки",
             reply_markup=get_back_keyboard("broadcast")
         )
@@ -1558,7 +1575,8 @@ async def show_user_questions(callback: CallbackQuery):
         return
     
     # TODO: Реализовать работу с вопросами когда будет готова таблица questions
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         "❓ <b>Вопросы пользователей</b>\n\n"
         "🚧 Функция вопросов пользователей будет реализована в следующих версиях.\n\n"
         "Планируемые возможности:\n"
@@ -1635,7 +1653,8 @@ async def show_all_events_for_management(callback: CallbackQuery):
             events = result.scalars().all()
         
         if not events:
-            await callback.message.edit_text(
+            await safe_edit_message(
+                callback,
                 "📅 <b>Все мероприятия</b>\n\n"
                 "Пока нет созданных мероприятий",
                 parse_mode="HTML",
@@ -1654,7 +1673,8 @@ async def show_all_events_for_management(callback: CallbackQuery):
         text += f"📊 Всего: {len(events)}\n\n"
         text += "Выберите мероприятие:"
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             text,
             parse_mode="HTML",
             reply_markup=build_events_list_keyboard(events, "manage_event")
@@ -1679,7 +1699,8 @@ async def export_data_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]
     ]
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         "📋 <b>Экспорт данных</b>\n\n"
         "Выберите тип отчета:",
         parse_mode="HTML",
@@ -1695,7 +1716,8 @@ async def generate_export(callback: CallbackQuery):
     
     export_type = callback.data.split("_")[1]
     
-    await callback.message.edit_text(
+    await safe_edit_message(
+        callback,
         "📊 <b>Генерация отчета...</b>\n\n"
         "Подождите, это может занять некоторое время.",
         parse_mode="HTML"
@@ -1800,7 +1822,8 @@ async def generate_export(callback: CallbackQuery):
                     date = user.created_at.strftime('%d.%m.%Y')
                     report += f"• {name} • {date}\n"
         
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             report,
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1811,7 +1834,8 @@ async def generate_export(callback: CallbackQuery):
         
     except Exception as e:
         logger.error(f"Ошибка генерации экспорта {export_type}: {e}")
-        await callback.message.edit_text(
+        await safe_edit_message(
+            callback,
             "❌ Произошла ошибка при генерации отчета",
             reply_markup=get_back_keyboard("export_data")
         )
